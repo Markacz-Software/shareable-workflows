@@ -1,0 +1,57 @@
+name: Update App Image Tag
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "App name (folder under environments/prod/apps/)"
+        required: true
+        type: string
+      image_tag:
+        description: "New image tag"
+        required: true
+        type: string
+    secrets:
+      platform_pat:
+        required: true
+
+jobs:
+  update-tag:
+    runs-on: arc-runners
+    steps:
+      - name: Checkout markacz-platform
+        uses: actions/checkout@v4
+        with:
+          repository: Markacz-Software/markacz-platform
+          token: ${{ secrets.platform_pat }}
+
+      - name: Install yq
+        uses: mikefarah/yq@master
+
+      - name: Update image tag
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          VALUES_FILE="environments/prod/apps/${APP_NAME}/values.yaml"
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "ERROR: $VALUES_FILE not found"
+            exit 1
+          fi
+          yq -i ".platform-common.image.tag = \"${IMAGE_TAG}\"" "$VALUES_FILE"
+
+      - name: Commit and push
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "chore(${APP_NAME}): update image to ${IMAGE_TAG}"
+          for i in 1 2 3 4 5; do
+            git pull --rebase && git push && exit 0
+            sleep $((i * 2))
+          done
+          echo "Failed to push after 5 attempts"
+          exit 1
