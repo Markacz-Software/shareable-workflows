@@ -15,20 +15,41 @@ on:
       platform_pat:
         required: true
 
+permissions:
+  contents: read
+
 jobs:
   update-tag:
     runs-on: arc-runners
     steps:
+      - name: Validate inputs
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          if [[ ! "$APP_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            echo "ERROR: app_name contains invalid characters: $APP_NAME"
+            exit 1
+          fi
+          if [[ -z "$IMAGE_TAG" ]]; then
+            echo "ERROR: image_tag is empty"
+            exit 1
+          fi
+
       - name: Checkout markacz-platform
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: Markacz-Software/markacz-platform
           token: ${{ secrets.platform_pat }}
 
       - name: Install yq
+        env:
+          YQ_VERSION: v4.52.4
         run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
+          mkdir -p "$HOME/.local/bin"
+          wget -qO "$HOME/.local/bin/yq" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          chmod +x "$HOME/.local/bin/yq"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Update image tag
         env:
@@ -37,19 +58,25 @@ jobs:
         run: |
           VALUES_FILE="environments/prod/apps/${APP_NAME}/values.yaml"
           if [ ! -f "$VALUES_FILE" ]; then
-            echo "ERROR: $VALUES_FILE not found"
+            echo "ERROR: Values file not found for app: ${APP_NAME}"
             exit 1
           fi
-          yq -i ".platform-common.image.tag = \"${IMAGE_TAG}\"" "$VALUES_FILE"
+          export IMAGE_TAG
+          yq -i '.platform-common.image.tag = strenv(IMAGE_TAG)' "$VALUES_FILE"
 
       - name: Commit and push
         env:
           APP_NAME: ${{ inputs.app_name }}
           IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
+          VALUES_FILE="environments/prod/apps/${APP_NAME}/values.yaml"
+          if git diff --quiet "$VALUES_FILE"; then
+            echo "Tag is already ${IMAGE_TAG}, nothing to commit"
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .
+          git add "$VALUES_FILE"
           git commit -m "chore(${APP_NAME}): update image to ${IMAGE_TAG}"
           for i in 1 2 3 4 5; do
             git pull --rebase && git push && exit 0
