@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       image_repository:
-        description: "Full image repository, e.g. ghcr.io/markacz-software/qrx"
+        description: "Full image repository, e.g. ghcr.io/<owner>/<name>"
         required: true
         type: string
       image_tag:
@@ -32,11 +32,16 @@ jobs:
     steps:
       - name: Validate inputs
         env:
+          TARGET_REPOSITORY: ${{ vars.DOCKER_PLATFORM_REPO }}
           STACK_NAME: ${{ inputs.stack_name }}
           SERVICE_NAME: ${{ inputs.service_name }}
           IMAGE_REPOSITORY: ${{ inputs.image_repository }}
           IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
+          if [[ -z "$TARGET_REPOSITORY" ]]; then
+            echo "ERROR: vars.DOCKER_PLATFORM_REPO is not set at the org or repo level"
+            exit 1
+          fi
           if [[ ! "$STACK_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
             echo "ERROR: stack_name contains invalid characters: $STACK_NAME"
             exit 1
@@ -54,10 +59,10 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout markacz-platform-docker
+      - name: Checkout target repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: Markacz-Software/markacz-platform-docker
+          repository: ${{ vars.DOCKER_PLATFORM_REPO }}
           token: ${{ secrets.platform_pat }}
 
       - name: Install yq
