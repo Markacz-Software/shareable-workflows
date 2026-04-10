@@ -28,7 +28,7 @@ permissions:
 
 jobs:
   update-compose-image:
-    runs-on: arc-runners
+    runs-on: ubuntu-latest
     steps:
       - name: Validate inputs
         env:
