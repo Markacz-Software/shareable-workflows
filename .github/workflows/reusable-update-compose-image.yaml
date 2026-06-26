@@ -3,6 +3,10 @@ name: Update Compose Image Tag
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: "Runner label for the update job"
+        required: true
+        type: string
       stack_name:
         description: "Stack name (folder under stacks/)"
         required: true
@@ -28,7 +32,7 @@ permissions:
 
 jobs:
   update-compose-image:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     steps:
       - name: Validate inputs
         env:
