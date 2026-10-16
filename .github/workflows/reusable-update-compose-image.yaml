@@ -13,15 +13,19 @@ on:
         type: string
       service_name:
         description: "Compose service key under services:"
-        required: true
+        required: false
         type: string
       image_repository:
         description: "Full image repository, e.g. ghcr.io/<owner>/<name>"
-        required: true
+        required: false
         type: string
       image_tag:
         description: "New image tag"
-        required: true
+        required: false
+        type: string
+      updates:
+        description: "Optional newline-separated service|repository|tag updates"
+        required: false
         type: string
     secrets:
       platform_pat:
@@ -41,6 +45,7 @@ jobs:
           SERVICE_NAME: ${{ inputs.service_name }}
           IMAGE_REPOSITORY: ${{ inputs.image_repository }}
           IMAGE_TAG: ${{ inputs.image_tag }}
+          UPDATES: ${{ inputs.updates }}
         run: |
           if [[ -z "$TARGET_REPOSITORY" ]]; then
             echo "ERROR: vars.DOCKER_PLATFORM_REPO is not set at the org or repo level"
@@ -50,17 +55,35 @@ jobs:
             echo "ERROR: stack_name contains invalid characters: $STACK_NAME"
             exit 1
           fi
-          if [[ ! "$SERVICE_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-            echo "ERROR: service_name contains invalid characters: $SERVICE_NAME"
-            exit 1
-          fi
-          if [[ ! "$IMAGE_REPOSITORY" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
-            echo "ERROR: image_repository contains invalid characters: $IMAGE_REPOSITORY"
-            exit 1
-          fi
-          if [[ -z "$IMAGE_TAG" ]]; then
-            echo "ERROR: image_tag is empty"
-            exit 1
+          if [[ -n "$UPDATES" ]]; then
+            while IFS='|' read -r service repository tag extra; do
+              [[ -z "$service$repository$tag$extra" ]] && continue
+              if [[ -n "$extra" || ! "$service" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+                echo "ERROR: invalid service entry in updates: $service"
+                exit 1
+              fi
+              if [[ ! "$repository" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+                echo "ERROR: invalid image repository in updates: $repository"
+                exit 1
+              fi
+              if [[ -z "$tag" ]]; then
+                echo "ERROR: image tag is empty in updates"
+                exit 1
+              fi
+            done <<< "$UPDATES"
+          else
+            if [[ ! "$SERVICE_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+              echo "ERROR: service_name contains invalid characters: $SERVICE_NAME"
+              exit 1
+            fi
+            if [[ ! "$IMAGE_REPOSITORY" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+              echo "ERROR: image_repository contains invalid characters: $IMAGE_REPOSITORY"
+              exit 1
+            fi
+            if [[ -z "$IMAGE_TAG" ]]; then
+              echo "ERROR: image_tag is empty"
+              exit 1
+            fi
           fi
 
       - name: Checkout target repository
@@ -73,8 +96,13 @@ jobs:
         env:
           YQ_VERSION: v4.52.4
         run: |
+          case "$(uname -m)" in
+            x86_64) YQ_ARCH=amd64 ;;
+            aarch64|arm64) YQ_ARCH=arm64 ;;
+            *) echo "ERROR: unsupported runner architecture: $(uname -m)"; exit 1 ;;
+          esac
           mkdir -p "$HOME/.local/bin"
-          wget -qO "$HOME/.local/bin/yq" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          wget -qO "$HOME/.local/bin/yq" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${YQ_ARCH}"
           chmod +x "$HOME/.local/bin/yq"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -84,31 +112,46 @@ jobs:
           SERVICE_NAME: ${{ inputs.service_name }}
           IMAGE_REPOSITORY: ${{ inputs.image_repository }}
           IMAGE_TAG: ${{ inputs.image_tag }}
+          UPDATES: ${{ inputs.updates }}
         run: |
           COMPOSE_FILE="stacks/${STACK_NAME}/compose.yaml"
           if [ ! -f "$COMPOSE_FILE" ]; then
             echo "ERROR: Compose file not found for stack: ${STACK_NAME}"
             exit 1
           fi
-          NEW_IMAGE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
-          export SERVICE_NAME NEW_IMAGE
-          yq -i '.services[strenv(SERVICE_NAME)].image = strenv(NEW_IMAGE)' "$COMPOSE_FILE"
+          if [[ -n "$UPDATES" ]]; then
+            while IFS='|' read -r SERVICE_NAME IMAGE_REPOSITORY IMAGE_TAG extra; do
+              [[ -z "$SERVICE_NAME$IMAGE_REPOSITORY$IMAGE_TAG$extra" ]] && continue
+              NEW_IMAGE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+              export SERVICE_NAME NEW_IMAGE
+              yq -i '.services[strenv(SERVICE_NAME)].image = strenv(NEW_IMAGE)' "$COMPOSE_FILE"
+            done <<< "$UPDATES"
+          else
+            NEW_IMAGE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+            export SERVICE_NAME NEW_IMAGE
+            yq -i '.services[strenv(SERVICE_NAME)].image = strenv(NEW_IMAGE)' "$COMPOSE_FILE"
+          fi
 
       - name: Commit and push
         env:
           STACK_NAME: ${{ inputs.stack_name }}
           SERVICE_NAME: ${{ inputs.service_name }}
           IMAGE_TAG: ${{ inputs.image_tag }}
+          UPDATES: ${{ inputs.updates }}
         run: |
           COMPOSE_FILE="stacks/${STACK_NAME}/compose.yaml"
           if git diff --quiet "$COMPOSE_FILE"; then
-            echo "Tag is already ${IMAGE_TAG}, nothing to commit"
+            echo "Image tag is already current, nothing to commit"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$COMPOSE_FILE"
-          git commit -m "chore(${STACK_NAME}/${SERVICE_NAME}): update image to ${IMAGE_TAG}"
+          if [[ -n "$UPDATES" ]]; then
+            git commit -m "chore(${STACK_NAME}): update image tags"
+          else
+            git commit -m "chore(${STACK_NAME}/${SERVICE_NAME}): update image to ${IMAGE_TAG}"
+          fi
           for i in 1 2 3 4 5; do
             git pull --rebase && git push && exit 0
             sleep $((i * 2))
