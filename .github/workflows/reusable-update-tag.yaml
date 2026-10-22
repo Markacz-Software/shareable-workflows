@@ -3,13 +3,37 @@ name: Update App Image Tag
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: "Runner label for the update job (defaults to ubuntu-latest)"
+        required: false
+        type: string
       app_name:
-        description: "App name (folder under environments/prod/apps/)"
+        description: "Deployment name (legacy: folder under environments/prod/apps/)"
         required: true
         type: string
       image_tag:
         description: "New image tag"
-        required: true
+        required: false
+        type: string
+      target_repository:
+        description: "GitOps repository (defaults to K3S_PLATFORM_REPO)"
+        required: false
+        type: string
+      manifest_path:
+        description: "Kubernetes manifest containing the Deployment (legacy values path when omitted)"
+        required: false
+        type: string
+      image_repository:
+        description: "Image repository, e.g. ghcr.io/markacz-software/verseframe"
+        required: false
+        type: string
+      container_name:
+        description: "Deployment container name (defaults to app_name)"
+        required: false
+        type: string
+      updates:
+        description: "Optional newline-separated container|repository|tag updates in one manifest"
+        required: false
         type: string
     secrets:
       platform_pat:
@@ -20,39 +44,69 @@ permissions:
 
 jobs:
   update-tag:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
     steps:
       - name: Validate inputs
         env:
-          TARGET_REPOSITORY: ${{ vars.K3S_PLATFORM_REPO }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository || vars.K3S_PLATFORM_REPO }}
           APP_NAME: ${{ inputs.app_name }}
           IMAGE_TAG: ${{ inputs.image_tag }}
+          MANIFEST_FILE: ${{ inputs.manifest_path }}
+          IMAGE_REPOSITORY: ${{ inputs.image_repository }}
+          CONTAINER_NAME: ${{ inputs.container_name || inputs.app_name }}
+          UPDATES: ${{ inputs.updates }}
         run: |
           if [[ -z "$TARGET_REPOSITORY" ]]; then
-            echo "ERROR: vars.K3S_PLATFORM_REPO is not set at the org or repo level"
+            echo "ERROR: target_repository or vars.K3S_PLATFORM_REPO is required"
+            exit 1
+          fi
+          if [[ ! "$TARGET_REPOSITORY" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
+            echo "ERROR: invalid target repository"
             exit 1
           fi
           if [[ ! "$APP_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
             echo "ERROR: app_name contains invalid characters: $APP_NAME"
             exit 1
           fi
-          if [[ -z "$IMAGE_TAG" ]]; then
-            echo "ERROR: image_tag is empty"
+          if [[ -n "$MANIFEST_FILE" ]]; then
+            if [[ ! "$MANIFEST_FILE" =~ ^platform/([a-zA-Z0-9_-]+/)*[a-zA-Z0-9_-]+\.ya?ml$ ]]; then
+              echo "ERROR: manifest_path must be a YAML file under platform/"
+              exit 1
+            fi
+            if [[ -n "$UPDATES" ]]; then
+              while IFS='|' read -r container repository tag extra; do
+                [[ -z "$container$repository$tag$extra" ]] && continue
+                if [[ -n "$extra" || ! "$container" =~ ^[a-zA-Z0-9_-]+$ || ! "$repository" =~ ^ghcr\.io/[a-zA-Z0-9._/-]+$ || ! "$tag" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+                  echo "ERROR: invalid container, image repository, or tag in updates"
+                  exit 1
+                fi
+              done <<< "$UPDATES"
+            elif [[ ! "$IMAGE_REPOSITORY" =~ ^ghcr\.io/[a-zA-Z0-9._/-]+$ || ! "$IMAGE_TAG" =~ ^[a-zA-Z0-9_.-]+$ || ! "$CONTAINER_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+              echo "ERROR: invalid image repository, tag, or container name"
+              exit 1
+            fi
+          elif [[ -n "$UPDATES" || -z "$IMAGE_TAG" ]]; then
+            echo "ERROR: legacy values updates require image_tag and do not support updates"
             exit 1
           fi
 
       - name: Checkout target repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: ${{ vars.K3S_PLATFORM_REPO }}
+          repository: ${{ inputs.target_repository || vars.K3S_PLATFORM_REPO }}
           token: ${{ secrets.platform_pat }}
 
       - name: Install yq
         env:
           YQ_VERSION: v4.52.4
         run: |
+          case "$(uname -m)" in
+            x86_64) YQ_ARCH=amd64 ;;
+            aarch64|arm64) YQ_ARCH=arm64 ;;
+            *) echo "ERROR: unsupported runner architecture: $(uname -m)"; exit 1 ;;
+          esac
           mkdir -p "$HOME/.local/bin"
-          wget -qO "$HOME/.local/bin/yq" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          wget -qO "$HOME/.local/bin/yq" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${YQ_ARCH}"
           chmod +x "$HOME/.local/bin/yq"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -60,7 +114,41 @@ jobs:
         env:
           APP_NAME: ${{ inputs.app_name }}
           IMAGE_TAG: ${{ inputs.image_tag }}
+          MANIFEST_FILE: ${{ inputs.manifest_path }}
+          IMAGE_REPOSITORY: ${{ inputs.image_repository }}
+          CONTAINER_NAME: ${{ inputs.container_name || inputs.app_name }}
+          UPDATES: ${{ inputs.updates }}
         run: |
+          if [[ -n "$MANIFEST_FILE" ]]; then
+            if [[ ! -f "$MANIFEST_FILE" ]]; then
+              echo "ERROR: manifest not found: $MANIFEST_FILE"
+              exit 1
+            fi
+            update_container() {
+              CONTAINER_NAME="$1" NEW_IMAGE="$2:$3"
+              export APP_NAME CONTAINER_NAME NEW_IMAGE
+              matches=$(yq 'select(.kind == "Deployment" and .metadata.name == strenv(APP_NAME)) | .spec.template.spec.containers[] | select(.name == strenv(CONTAINER_NAME)) | .image' "$MANIFEST_FILE" | wc -l | tr -d ' ')
+              if [[ "$matches" != 1 ]]; then
+                echo "ERROR: expected one Deployment/container match for $CONTAINER_NAME, found $matches"
+                exit 1
+              fi
+              yq -i '(select(.kind == "Deployment" and .metadata.name == strenv(APP_NAME)).spec.template.spec.containers[] | select(.name == strenv(CONTAINER_NAME)).image) = strenv(NEW_IMAGE)' "$MANIFEST_FILE"
+              updated=$(yq 'select(.kind == "Deployment" and .metadata.name == strenv(APP_NAME)) | .spec.template.spec.containers[] | select(.name == strenv(CONTAINER_NAME)) | .image' "$MANIFEST_FILE")
+              if [[ "$updated" != "$NEW_IMAGE" ]]; then
+                echo "ERROR: image update did not match the requested image"
+                exit 1
+              fi
+            }
+            if [[ -n "$UPDATES" ]]; then
+              while IFS='|' read -r container repository tag extra; do
+                [[ -z "$container$repository$tag$extra" ]] && continue
+                update_container "$container" "$repository" "$tag"
+              done <<< "$UPDATES"
+            else
+              update_container "$CONTAINER_NAME" "$IMAGE_REPOSITORY" "$IMAGE_TAG"
+            fi
+            exit 0
+          fi
           VALUES_FILE="environments/prod/apps/${APP_NAME}/values.yaml"
           if [ ! -f "$VALUES_FILE" ]; then
             echo "ERROR: Values file not found for app: ${APP_NAME}"
@@ -73,16 +161,22 @@ jobs:
         env:
           APP_NAME: ${{ inputs.app_name }}
           IMAGE_TAG: ${{ inputs.image_tag }}
+          MANIFEST_FILE: ${{ inputs.manifest_path }}
+          UPDATES: ${{ inputs.updates }}
         run: |
-          VALUES_FILE="environments/prod/apps/${APP_NAME}/values.yaml"
-          if git diff --quiet "$VALUES_FILE"; then
+          TARGET_FILE="${MANIFEST_FILE:-environments/prod/apps/${APP_NAME}/values.yaml}"
+          if git diff --quiet "$TARGET_FILE"; then
             echo "Tag is already ${IMAGE_TAG}, nothing to commit"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$VALUES_FILE"
-          git commit -m "chore(${APP_NAME}): update image to ${IMAGE_TAG}"
+          git add "$TARGET_FILE"
+          if [[ -n "$UPDATES" ]]; then
+            git commit -m "chore(${APP_NAME}): update image tags"
+          else
+            git commit -m "chore(${APP_NAME}): update image to ${IMAGE_TAG}"
+          fi
           for i in 1 2 3 4 5; do
             git pull --rebase && git push && exit 0
             sleep $((i * 2))
