@@ -101,12 +101,13 @@ jobs:
           YQ_VERSION: v4.52.4
         run: |
           case "$(uname -m)" in
-            x86_64) YQ_ARCH=amd64 ;;
-            aarch64|arm64) YQ_ARCH=arm64 ;;
+            x86_64) YQ_ARCH=amd64; YQ_SHA256=0c4d965ea944b64b8fddaf7f27779ee3034e5693263786506ccd1c120f184e8c ;;
+            aarch64|arm64) YQ_ARCH=arm64; YQ_SHA256=4c2cc022a129be5cc1187959bb4b09bebc7fb543c5837b93001c68f97ce39a5d ;;
             *) echo "ERROR: unsupported runner architecture: $(uname -m)"; exit 1 ;;
           esac
           mkdir -p "$HOME/.local/bin"
           wget -qO "$HOME/.local/bin/yq" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${YQ_ARCH}"
+          echo "$YQ_SHA256  $HOME/.local/bin/yq" | sha256sum -c -
           chmod +x "$HOME/.local/bin/yq"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
